@@ -80,6 +80,75 @@ if (r0.feasible) {
   check(p.totalCost === 0, `纳米代价：总代价须严格为 0（实际 ${p.totalCost}）`);
 }
 
+// 十进制等价代价场景：P(+1)、N(-1)、Z1/Z2(0)，四块单位质量，
+// 载荷上限 4、力矩区间 [-1,1]。满足最终力矩的方案 b1@P+b2@N（0.1+0.2）
+// 与 b1@N+b2@P（0.3+0）按录入十进制值同为 0.3，余量同为 0（首步贴 ±1 闭边界），
+// 须按位置录入序号决胜为 0,0,0,0——浮点 0.1+0.2=0.30000000000000004 不得制造成本差。
+const decimalTieScenario: Scenario = {
+  rails: [
+    { id: 'P', name: 'P', coordinate: 1 },
+    { id: 'N', name: 'N', coordinate: -1 },
+    { id: 'Z1', name: 'Z1', coordinate: 0 },
+    { id: 'Z2', name: 'Z2', coordinate: 0 },
+  ],
+  blocks: [
+    { id: 'b1', name: 'b1', mass: 1, options: [{ railId: 'P', cost: 0.1 }, { railId: 'N', cost: 0.3 }] },
+    { id: 'b2', name: 'b2', mass: 1, options: [{ railId: 'N', cost: 0.2 }, { railId: 'P', cost: 0 }] },
+    { id: 'b3', name: 'b3', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+    { id: 'b4', name: 'b4', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+  ],
+  limits: { maxLoad: 4, minTorque: -1, maxTorque: 1 },
+};
+
+const rt = adjudicate(decimalTieScenario);
+check(rt.feasible, '裁决模块：十进制等价代价场景应判定为可行');
+if (rt.feasible) {
+  const byBlock = new Map(rt.plan.steps.map((s) => [Number(s.blockName.slice(1)) - 1, s]));
+  check(
+    [0, 1, 2, 3].map((k) => byBlock.get(k)?.optionIndex).join(',') === '0,0,0,0',
+    '十进制等价：同成本须按稳定序号裁决为 0,0,0,0（实际 ' +
+      [0, 1, 2, 3].map((k) => byBlock.get(k)?.optionIndex).join(',') +
+      '）',
+  );
+  check(
+    [0, 1].map((k) => byBlock.get(k)?.railId).join('+') === 'P+N',
+    '十进制等价：方案应为 b1@P + b2@N（实际 ' + [0, 1].map((k) => byBlock.get(k)?.railId).join('+') + '）',
+  );
+  check(rt.plan.totalCost === 0.3, `十进制等价：总代价应为 0.3（实际 ${rt.plan.totalCost}）`);
+  check(rt.plan.minTorqueMargin === 0, '十进制等价：力矩余量应为 0（首步贴闭区间边界）');
+  check(rt.plan.finalMass === 4 && rt.plan.finalTorque === 0, '十进制等价：载荷恰好 4（上限）、最终力矩归零');
+  check(
+    rt.plan.steps.every((s) => Math.abs(s.cumulativeTorque) <= 1 + 1e-9 && s.cumulativeMass <= 4 + 1e-9),
+    '十进制等价：各前缀满足载荷与力矩闭区间（含 ±1/4 边界）',
+  );
+}
+
+// 真实不等十进制成本：b2@N 改为 0.201，则 0.1+0.201=0.301 严格大于 0.3，
+// 差额仅 0.001 也必须选 b1@N+b2@P（序号 1,1），序号决胜不得覆盖真实成本差。
+const decimalDiffScenario: Scenario = {
+  ...decimalTieScenario,
+  blocks: [
+    { id: 'b1', name: 'b1', mass: 1, options: [{ railId: 'P', cost: 0.1 }, { railId: 'N', cost: 0.3 }] },
+    { id: 'b2', name: 'b2', mass: 1, options: [{ railId: 'N', cost: 0.201 }, { railId: 'P', cost: 0 }] },
+    { id: 'b3', name: 'b3', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+    { id: 'b4', name: 'b4', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+  ],
+};
+
+const rd = adjudicate(decimalDiffScenario);
+check(rd.feasible, '裁决模块：真实不等十进制成本场景应判定为可行');
+if (rd.feasible) {
+  const byBlock = new Map(rd.plan.steps.map((s) => [Number(s.blockName.slice(1)) - 1, s]));
+  check(
+    [0, 1, 2, 3].map((k) => byBlock.get(k)?.optionIndex).join(',') === '1,1,0,0',
+    '十进制不等：须严格取较低成本方案 1,1,0,0（实际 ' +
+      [0, 1, 2, 3].map((k) => byBlock.get(k)?.optionIndex).join(',') +
+      '）',
+  );
+  check(rd.plan.totalCost === 0.3, `十进制不等：总代价应为严格较低的 0.3（实际 ${rd.plan.totalCost}）`);
+  check(rd.plan.finalMass === 4 && rd.plan.finalTorque === 0, '十进制不等：载荷与力矩边界保持成立');
+}
+
 // 不可行场景：深度 1 即止步，最深前缀为 b1@R（余量最大），剩余选择同时触发载荷与力矩限制。
 const infeasibleScenario: Scenario = {
   rails: [{ id: 'R', name: 'R', coordinate: 1 }],
