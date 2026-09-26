@@ -1,3 +1,11 @@
+import {
+  DECIMAL_ZERO,
+  decimalAdd,
+  decimalCompare,
+  decimalFromNumber,
+  decimalToNumber,
+  type Decimal,
+} from './decimal';
 import type {
   AdjudicationOutcome,
   Limits,
@@ -10,7 +18,8 @@ import type {
 
 /**
  * 数值比较容差：质量/力臂为浮点录入，载荷与力矩的边界判定及力矩余量决胜使用。
- * 注意：安装代价不使用此容差——代价是逐位有意义的录入值，必须严格比较。
+ * 注意：安装代价不使用此容差——代价是逐位有意义的录入值，按十进制精确比较
+ * （见 ./decimal），任何真实的十进制差额（哪怕 1e-10）都必须体现。
  */
 export const EPS = 1e-9;
 
@@ -20,6 +29,8 @@ interface FlatOption {
   railName: string;
   coordinate: number;
   cost: number;
+  /** 本选项代价的精确十进制值（由录入值的最短往返表示恢复）。 */
+  costDecimal: Decimal;
 }
 
 interface FlatBlock {
@@ -30,15 +41,12 @@ interface FlatBlock {
 }
 
 /**
- * 升序累加非负代价。安装代价是录入值而非物理测量值，必须逐位严格比较，
- * 不得套用 EPS（否则 1e-10 这样的纳米级代价差会被误判为并列）。
- * 按固定升序累加使总和与挂装次序无关：同一组代价无论以何种次序挂装，
- * 得到的总代价逐位相同，真正同代价的方案才能稳定地落到序号决胜。
+ * 候选方案：对外只暴露 Plan（totalCost 为精确十进制总和的正确舍入值），
+ * 内部另携带精确十进制总代价，供决胜与分支限界严格比较。
  */
-function sumCostsAscending(sortedAscending: readonly number[]): number {
-  let total = 0;
-  for (const c of sortedAscending) total += c;
-  return total;
+interface Candidate {
+  plan: Plan;
+  cost: Decimal;
 }
 
 function torqueMarginOf(torque: number, limits: Limits): number {
@@ -58,17 +66,18 @@ function lexCompareSteps(a: StepRecord[], b: StepRecord[]): number {
 /**
  * 裁决优先级（依次）：
  * 1. 力矩余量（所有前缀中的最小值）最大者优先；
- * 2. 总安装代价最小者优先（严格数值比较，不使用容差：代价是录入值，
- *    任何实际差异——哪怕仅 1e-10——都必须体现，序号决胜不得覆盖成本差）；
+ * 2. 总安装代价最小者优先（按录入的十进制值精确比较：0.1+0.2 与 0.3 视为同成本，
+ *    而 1e-10 级的真实差额仍严格区分，序号决胜不得覆盖成本差）；
  * 3. 按挂装顺序的 (块录入序号, 位置录入序号) 序列字典序最小者优先。
  */
-function isBetter(a: Plan, b: Plan | null): boolean {
+function isBetter(a: Candidate, b: Candidate | null): boolean {
   if (b === null) return true;
-  if (a.minTorqueMargin > b.minTorqueMargin + EPS) return true;
-  if (a.minTorqueMargin < b.minTorqueMargin - EPS) return false;
-  if (a.totalCost < b.totalCost) return true;
-  if (a.totalCost > b.totalCost) return false;
-  return lexCompareSteps(a.steps, b.steps) < 0;
+  if (a.plan.minTorqueMargin > b.plan.minTorqueMargin + EPS) return true;
+  if (a.plan.minTorqueMargin < b.plan.minTorqueMargin - EPS) return false;
+  const costOrder = decimalCompare(a.cost, b.cost);
+  if (costOrder < 0) return true;
+  if (costOrder > 0) return false;
+  return lexCompareSteps(a.plan.steps, b.plan.steps) < 0;
 }
 
 /**
@@ -77,6 +86,10 @@ function isBetter(a: Plan, b: Plan | null): boolean {
  * 搜索按挂装顺序逐步进行，每一个前缀状态都同时校验总载荷与力矩闭区间，
  * 因此绝不出现“先定最终位置再事后排序”的情况；力矩余量沿前缀单调不增、
  * 总代价单调不减（代价非负），据此对当前最优解做分支限界。
+ *
+ * 总代价以精确十进制累计：十进制加法可交换且与求和次序无关，同一组位置
+ * 选择无论以何种次序挂装都得到逐位相同的总代价，真正同成本的方案才能
+ * 稳定地落到序号决胜。
  */
 export function adjudicate(scenario: Scenario): AdjudicationOutcome {
   const railById = new Map(scenario.rails.map((r) => [r.id, r]));
@@ -93,6 +106,7 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
         railName: rail.name,
         coordinate: rail.coordinate,
         cost: o.cost,
+        costDecimal: decimalFromNumber(o.cost),
       };
     }),
   }));
@@ -101,22 +115,29 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
 
   const used = new Array<boolean>(n).fill(false);
   const steps: StepRecord[] = [];
-  /** 当前路径已选代价，始终保持升序，使总代价与挂装次序无关。 */
-  const pathCosts: number[] = [];
-  let best: Plan | null = null;
+  let best: Candidate | null = null;
+  /**
+   * 按声明类型读取 best。best 由下方 dfs 闭包赋值，TypeScript 的控制流分析
+   * 不会把闭包内的赋值反映到调用点之后（直接引用会被窄化为 null），
+   * 因此调用 dfs 后须经此函数边界读取。
+   */
+  const getBest = (): Candidate | null => best;
   /** 每个深度上按裁决优先级最优的可行前缀（用于无可行方案时的诊断）。 */
-  const bestPartial: (Plan | null)[] = new Array(n + 1).fill(null);
+  const bestPartial: (Candidate | null)[] = new Array(n + 1).fill(null);
 
-  const snapshot = (totalCost: number, minTorqueMargin: number): Plan => ({
-    steps: steps.map((s) => ({ ...s })),
-    totalCost,
-    minTorqueMargin,
-    finalMass: steps.length > 0 ? steps[steps.length - 1].cumulativeMass : 0,
-    finalTorque: steps.length > 0 ? steps[steps.length - 1].cumulativeTorque : 0,
+  const snapshot = (cost: Decimal, minTorqueMargin: number): Candidate => ({
+    plan: {
+      steps: steps.map((s) => ({ ...s })),
+      totalCost: decimalToNumber(cost),
+      minTorqueMargin,
+      finalMass: steps.length > 0 ? steps[steps.length - 1].cumulativeMass : 0,
+      finalTorque: steps.length > 0 ? steps[steps.length - 1].cumulativeTorque : 0,
+    },
+    cost,
   });
 
-  const dfs = (depth: number, mass: number, torque: number, totalCost: number, minMargin: number): void => {
-    const current = snapshot(totalCost, minMargin);
+  const dfs = (depth: number, mass: number, torque: number, cost: Decimal, minMargin: number): void => {
+    const current = snapshot(cost, minMargin);
     if (isBetter(current, bestPartial[depth])) bestPartial[depth] = current;
     if (depth === n) {
       if (isBetter(current, best)) best = current;
@@ -132,26 +153,14 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
         if (torqueAfter < limits.minTorque - EPS || torqueAfter > limits.maxTorque + EPS) continue;
         const margin = torqueMarginOf(torqueAfter, limits);
         const nextMinMargin = Math.min(minMargin, margin);
-        // 将本步代价按升序插路径后重算规范总代价（代价非负，规模 ≤7，开销可忽略）。
-        let lo = 0;
-        let hi = pathCosts.length;
-        while (lo < hi) {
-          const mid = (lo + hi) >> 1;
-          if (pathCosts[mid] <= opt.cost) lo = mid + 1;
-          else hi = mid;
-        }
-        pathCosts.splice(lo, 0, opt.cost);
-        const nextCost = sumCostsAscending(pathCosts);
+        // 精确十进制累加本步代价（代价非负，规模 ≤7，开销可忽略）。
+        const nextCost = decimalAdd(cost, opt.costDecimal);
         if (best) {
           // 力矩余量已严格劣于最优解，剪枝。
-          if (nextMinMargin < best.minTorqueMargin - EPS) {
-            pathCosts.splice(lo, 1);
-            continue;
-          }
+          if (nextMinMargin < best.plan.minTorqueMargin - EPS) continue;
           // 余量无法严格更优，而代价（非负，继续挂装只会更高）已严格更贵，剪枝。
-          // 严格数值比较：哪怕只差 1e-10 也必须保留更便宜的分支。
-          if (nextMinMargin < best.minTorqueMargin + EPS && nextCost > best.totalCost) {
-            pathCosts.splice(lo, 1);
+          // 精确十进制比较：哪怕只差 1e-10 也必须保留更便宜的分支。
+          if (nextMinMargin < best.plan.minTorqueMargin + EPS && decimalCompare(nextCost, best.cost) > 0) {
             continue;
           }
         }
@@ -173,23 +182,23 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
         dfs(depth + 1, massAfter, torqueAfter, nextCost, nextMinMargin);
         steps.pop();
         used[i] = false;
-        pathCosts.splice(lo, 1);
       }
     }
   };
 
-  dfs(0, 0, 0, 0, Number.POSITIVE_INFINITY);
+  dfs(0, 0, 0, DECIMAL_ZERO, Number.POSITIVE_INFINITY);
 
-  if (best) return { feasible: true, plan: best };
+  const winner = getBest();
+  if (winner) return { feasible: true, plan: winner.plan };
 
   // 无可行方案：定位最深的可行已选前缀（其下一步即最早无法继续挂装的位置）。
   let depth = n - 1;
   while (depth >= 0 && bestPartial[depth] === null) depth--;
   const witness = depth >= 0 ? bestPartial[depth] : null;
-  const witnessSteps = witness ? witness.steps : [];
+  const witnessSteps = witness ? witness.plan.steps : [];
   const usedBlocks = new Set(witnessSteps.map((s) => s.blockIndex));
-  const baseMass = witness ? witness.finalMass : 0;
-  const baseTorque = witness ? witness.finalTorque : 0;
+  const baseMass = witness ? witness.plan.finalMass : 0;
+  const baseTorque = witness ? witness.plan.finalTorque : 0;
 
   const violations: Violation[] = [];
   for (const block of blocks) {

@@ -99,6 +99,86 @@ describe('adjudicate · 可行方案与决胜规则', () => {
     expect(outcome.plan.steps.map((s) => s.optionIndex)).toEqual([0, 0, 0, 0]);
   });
 
+  it('十进制等价总代价：0.1+0.2 与 0.3+0 视为同成本，按序号决胜取 0,0,0,0', () => {
+    // 任务场景：4 块质量均为 1 的配重；导轨 P/N/Z1/Z2 力臂 1/-1/0/0；
+    // 载荷上限 4，力矩区间 [-1,1]。b1@P+b2@N 与 b1@N+b2@P 均满足最终力矩
+    // 要求且力矩余量相同，按录入的十进制值总代价都是 0.3；但二进制浮点下
+    // 0.1+0.2 = 0.30000000000000004 > 0.3+0，旧实现据此误选 1,1,0,0。
+    expect(0.1 + 0.2 === 0.3).toBe(false); // 佐证该场景在浮点下并不等价
+    const outcome = adjudicate({
+      rails: rails(['P', 1], ['N', -1], ['Z1', 0], ['Z2', 0]),
+      blocks: [
+        block('b1', 1, [[0, 0.1], [1, 0.3]]),
+        block('b2', 1, [[1, 0.2], [0, 0]]),
+        block('b3', 1, [[2, 0], [3, 0]]),
+        block('b4', 1, [[2, 0], [3, 0]]),
+      ],
+      limits: limits(4, -1, 1),
+    });
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    const plan = outcome.plan;
+    // 同成本须按序号决胜返回字典序最小的位置序号 0,0,0,0（b1@P → b2@N → b3@Z1 → b4@Z1）
+    expect(plan.steps.map((s) => s.optionIndex)).toEqual([0, 0, 0, 0]);
+    expect(plan.steps.map((s) => [s.blockIndex, s.railName])).toEqual([
+      [0, 'P'],
+      [1, 'N'],
+      [2, 'Z1'],
+      [3, 'Z1'],
+    ]);
+    // 总代价按十进制值精确为 0.3（不用 toBeCloseTo：容差会把缺陷掩盖掉）
+    expect(plan.totalCost).toBe(0.3);
+    // 力矩余量：挂装途中必然出现 |力矩| = 1 的前缀，余量为 0
+    expect(plan.minTorqueMargin).toBe(0);
+    // 载荷与力矩边界：最终载荷恰为上限 4，首步力矩恰为区间边界 +1
+    expect(plan.finalMass).toBe(4);
+    expect(plan.steps[0].cumulativeTorque).toBe(1);
+    expect(plan.steps[3].loadMargin).toBe(0);
+    for (const s of plan.steps) {
+      expect(s.cumulativeMass).toBeLessThanOrEqual(4 + EPS);
+      expect(s.cumulativeTorque).toBeGreaterThanOrEqual(-1 - EPS);
+      expect(s.cumulativeTorque).toBeLessThanOrEqual(1 + EPS);
+    }
+  });
+
+  it('十进制差额再小也严格优先较低成本（等价场景的双向对照）', () => {
+    // 与上一场景同构，仅微调代价：差额 1e-10 是真实的十进制差额，不得被
+    // 当作并列而落入序号决胜。
+    const run = (b1AtP: number, b2AtP: number) =>
+      adjudicate({
+        rails: rails(['P', 1], ['N', -1], ['Z1', 0], ['Z2', 0]),
+        blocks: [
+          block('b1', 1, [[0, b1AtP], [1, 0.3]]),
+          block('b2', 1, [[1, 0.2], [0, b2AtP]]),
+          block('b3', 1, [[2, 0], [3, 0]]),
+          block('b4', 1, [[2, 0], [3, 0]]),
+        ],
+        limits: limits(4, -1, 1),
+      });
+
+    // b1@N+b2@P 总代价 0.3000000001 严格更贵：仍须选 0,0,0,0（总代价 0.3）
+    const cheaper = run(0.1, 1e-10);
+    expect(cheaper.feasible).toBe(true);
+    if (cheaper.feasible) {
+      expect(cheaper.plan.totalCost).toBe(0.3);
+      expect(cheaper.plan.steps.map((s) => s.optionIndex)).toEqual([0, 0, 0, 0]);
+    }
+
+    // b1@P+b2@N 总代价 0.3000000001 严格更贵：须改选 1,1,0,0（总代价 0.3）
+    const dearer = run(0.1 + 1e-10, 0);
+    expect(dearer.feasible).toBe(true);
+    if (dearer.feasible) {
+      expect(dearer.plan.totalCost).toBe(0.3);
+      expect(dearer.plan.steps.map((s) => s.optionIndex)).toEqual([1, 1, 0, 0]);
+      expect(dearer.plan.steps.map((s) => [s.blockIndex, s.railName])).toEqual([
+        [0, 'N'],
+        [1, 'P'],
+        [2, 'Z1'],
+        [3, 'Z1'],
+      ]);
+    }
+  });
+
   it('力矩余量最大优先于总代价最小', () => {
     // 便宜方案（代价 2）余量仅 1；居中方案（代价 20）余量 5，必须选后者。
     const outcome = adjudicate({

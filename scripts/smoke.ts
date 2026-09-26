@@ -80,6 +80,65 @@ if (r0.feasible) {
   check(p.totalCost === 0, `纳米代价：总代价须严格为 0（实际 ${p.totalCost}）`);
 }
 
+// 十进制等价成本场景：b1@P+b2@N（0.1+0.2）与 b1@N+b2@P（0.3+0）按录入的
+// 十进制值总代价都是 0.3、力矩余量相同，须判为同成本并按序号决胜返回
+// 0,0,0,0（二进制浮点下 0.1+0.2 ≠ 0.3，旧实现会误选 1,1,0,0）。
+const decimalTieScenario: Scenario = {
+  rails: [
+    { id: 'P', name: 'P', coordinate: 1 },
+    { id: 'N', name: 'N', coordinate: -1 },
+    { id: 'Z1', name: 'Z1', coordinate: 0 },
+    { id: 'Z2', name: 'Z2', coordinate: 0 },
+  ],
+  blocks: [
+    { id: 'b1', name: 'b1', mass: 1, options: [{ railId: 'P', cost: 0.1 }, { railId: 'N', cost: 0.3 }] },
+    { id: 'b2', name: 'b2', mass: 1, options: [{ railId: 'N', cost: 0.2 }, { railId: 'P', cost: 0 }] },
+    { id: 'b3', name: 'b3', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+    { id: 'b4', name: 'b4', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+  ],
+  limits: { maxLoad: 4, minTorque: -1, maxTorque: 1 },
+};
+
+const r3 = adjudicate(decimalTieScenario);
+check(r3.feasible, '裁决模块：十进制等价成本场景应判定为可行');
+if (r3.feasible) {
+  const p = r3.plan;
+  check(p.totalCost === 0.3, `十进制等价：总代价应为 0.3（实际 ${p.totalCost}）`);
+  check(
+    p.steps.map((s) => s.optionIndex).join(',') === '0,0,0,0',
+    `十进制等价：同成本应按序号决胜返回 0,0,0,0（实际 ${p.steps.map((s) => s.optionIndex).join(',')}）`,
+  );
+  check(
+    p.steps.map((s) => `${s.blockIndex}@${s.railId}`).join(' ') === '0@P 1@N 2@Z1 3@Z1',
+    '十进制等价：挂装位置与次序应为 b1@P → b2@N → b3@Z1 → b4@Z1',
+  );
+  check(
+    p.steps.every((s) => s.cumulativeMass <= 4 + 1e-9 && Math.abs(s.cumulativeTorque) <= 1 + 1e-9),
+    '十进制等价：每个前缀状态均满足载荷与力矩限制',
+  );
+  check(p.finalMass === 4, '十进制等价：最终载荷应恰为上限 4（载荷边界）');
+  check(p.steps[0].cumulativeTorque === 1, '十进制等价：首步力矩应恰为区间边界 +1（力矩边界）');
+}
+
+// 真实不等成本对照：b2@P 代价 1e-10 使 b1@N+b2@P 总代价 0.3000000001 严格更贵，
+// 仍须选 0,0,0,0（总代价 0.3），极小十进制差额不得被当作并列。
+const unequalCostScenario: Scenario = {
+  ...decimalTieScenario,
+  blocks: decimalTieScenario.blocks.map((b) =>
+    b.id === 'b2' ? { ...b, options: [{ railId: 'N', cost: 0.2 }, { railId: 'P', cost: 1e-10 }] } : b,
+  ),
+};
+
+const r4 = adjudicate(unequalCostScenario);
+check(r4.feasible, '裁决模块：真实不等成本场景应判定为可行');
+if (r4.feasible) {
+  check(r4.plan.totalCost === 0.3, `真实不等成本：总代价应为 0.3（实际 ${r4.plan.totalCost}）`);
+  check(
+    r4.plan.steps.map((s) => s.optionIndex).join(',') === '0,0,0,0',
+    `真实不等成本：仍须选 0,0,0,0（实际 ${r4.plan.steps.map((s) => s.optionIndex).join(',')}）`,
+  );
+}
+
 // 不可行场景：深度 1 即止步，最深前缀为 b1@R（余量最大），剩余选择同时触发载荷与力矩限制。
 const infeasibleScenario: Scenario = {
   rails: [{ id: 'R', name: 'R', coordinate: 1 }],
